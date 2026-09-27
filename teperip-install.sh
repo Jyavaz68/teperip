@@ -408,7 +408,13 @@ PY
             fi
 
             save_state 1
-            exec bash "$0"
+            TMP_INSTALLER="/tmp/teperip-install.sh"
+curl -fsSL "https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh" -o "$TMP_INSTALLER" || {
+    echo "[ERROR] Failed to download installer again."
+    exit 1
+}
+chmod +x "$TMP_INSTALLER"
+exec bash "$TMP_INSTALLER"
 
         fi
 
