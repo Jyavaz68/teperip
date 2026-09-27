@@ -408,7 +408,7 @@ PY
             fi
 
             save_state 1
-            exec "$0"
+            exec bash "$0"
 
         fi
 
