@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CURRENT_VERSION="1.3.2"
+CURRENT_VERSION="1.3.3"
 
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
@@ -263,12 +263,13 @@ config_is_valid() {
         jq -r '.panel_url // empty' "$CONFIG_FILE" 2>/dev/null || true
     )"
 
+    # Backward compatibility: Check for both new and old (admin_user) keys
     panel_user="$(
-        jq -r '.panel_user // empty' "$CONFIG_FILE" 2>/dev/null || true
+        jq -r '.panel_user // .admin_user // empty' "$CONFIG_FILE" 2>/dev/null || true
     )"
 
     panel_pass="$(
-        jq -r '.panel_pass // empty' "$CONFIG_FILE" 2>/dev/null || true
+        jq -r '.panel_pass // .admin_pass // empty' "$CONFIG_FILE" 2>/dev/null || true
     )"
 
     [[ -n "$panel_url" && -n "$panel_user" && -n "$panel_pass" ]]
@@ -328,8 +329,8 @@ migrate_config() {
         .version = $version |
 
         .panel_url = (.panel_url // "") |
-        .panel_user = (.panel_user // "") |
-        .panel_pass = (.panel_pass // "") |
+        .panel_user = (.panel_user // .admin_user // "") |
+        .panel_pass = (.panel_pass // .admin_pass // "") |
 
         .check_interval = (.check_interval // 30) |
         .tolerance_seconds = (.tolerance_seconds // 60) |
@@ -375,11 +376,11 @@ prompt_config() {
     )"
 
     panel_user="$(
-        jq -r '.panel_user // empty' "$CONFIG_FILE" 2>/dev/null || true
+        jq -r '.panel_user // .admin_user // empty' "$CONFIG_FILE" 2>/dev/null || true
     )"
 
     panel_pass="$(
-        jq -r '.panel_pass // empty' "$CONFIG_FILE" 2>/dev/null || true
+        jq -r '.panel_pass // .admin_pass // empty' "$CONFIG_FILE" 2>/dev/null || true
     )"
 
     if [[ -z "$panel_url" ]]; then
@@ -2883,7 +2884,7 @@ BACKUP_DIR="$INSTALL_DIR/backups"
 
 SERVICE_NAME="pg_iplimit.service"
 
-CURRENT_VERSION="1.3.2"
+CURRENT_VERSION="1.3.3"
 
 INSTALLER_URL="https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh"
 
