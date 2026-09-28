@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CURRENT_VERSION="1.3.5"
+CURRENT_VERSION="1.3.6"
 
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
@@ -338,6 +338,7 @@ migrate_config() {
         .check_interval = (.check_interval // 30) |
         .tolerance_seconds = (.tolerance_seconds // 60) |
         .penalty_seconds = (.penalty_seconds // 60) |
+        .ip_stability_checks = (.ip_stability_checks // 2) |
 
         .request_timeout = (.request_timeout // 15) |
         .max_workers = (.max_workers // 5) |
@@ -365,7 +366,7 @@ migrate_config() {
 
 prompt_config() {
     local panel_url panel_user panel_pass
-    local check_interval tolerance penalty timeout workers
+    local check_interval tolerance penalty stability_checks timeout workers
     local input
 
     echo
@@ -428,6 +429,10 @@ prompt_config() {
         jq -r '.penalty_seconds // 60' "$CONFIG_FILE" 2>/dev/null || echo 60
     )"
 
+    stability_checks="$(
+        jq -r '.ip_stability_checks // 2' "$CONFIG_FILE" 2>/dev/null || echo 2
+    )"
+
     timeout="$(
         jq -r '.request_timeout // 15' "$CONFIG_FILE" 2>/dev/null || echo 15
     )"
@@ -444,6 +449,9 @@ prompt_config() {
 
     read -r -p "Disable duration for IP Limit (seconds) [$penalty]: " input
     penalty="${input:-$penalty}"
+
+    read -r -p "Stable IP checks required [$stability_checks]: " input
+    stability_checks="${input:-$stability_checks}"
 
     read -r -p "API Request Timeout (seconds) [$timeout]: " input
     timeout="${input:-$timeout}"
@@ -470,6 +478,7 @@ prompt_config() {
             check_interval: $check_interval,
             tolerance_seconds: $tolerance_seconds,
             penalty_seconds: $penalty_seconds,
+            ip_stability_checks: $ip_stability_checks,
 
             request_timeout: $request_timeout,
             max_workers: $max_workers,
@@ -501,7 +510,8 @@ create_initial_state() {
 {
   "blocked_users": {},
   "abuse": {},
-  "ip_history": {}
+  "ip_history": {},
+  "ip_stability": {}
 }
 JSON
 
@@ -617,6 +627,7 @@ type Config struct {
 	CheckInterval      int             `json:"check_interval"`
 	ToleranceSeconds   int             `json:"tolerance_seconds"`
 	PenaltySeconds     int             `json:"penalty_seconds"`
+	IPStabilityChecks  int             `json:"ip_stability_checks"`
 	RequestTimeout     int             `json:"request_timeout"`
 	MaxWorkers         int             `json:"max_workers"`
 	Verbose            bool            `json:"verbose"`
@@ -653,6 +664,11 @@ type IPSeen struct {
 	LastSeen  int64 `json:"last_seen"`
 }
 
+type IPStabilitySeen struct {
+	Consecutive int   `json:"consecutive"`
+	LastSeen    int64 `json:"last_seen"`
+}
+
 type UserAbuseState struct {
 	NewIPs  []AbuseEvent `json:"new_ips"`
 	Strikes []AbuseEvent `json:"strikes"`
@@ -665,9 +681,10 @@ type BlockedUser struct {
 }
 
 type RuntimeState struct {
-	BlockedUsers map[string]BlockedUser      `json:"blocked_users"`
-	Abuse        map[string]UserAbuseState   `json:"abuse"`
-	IPHistory    map[string]map[string]IPSeen `json:"ip_history"`
+	BlockedUsers map[string]BlockedUser                `json:"blocked_users"`
+	Abuse        map[string]UserAbuseState             `json:"abuse"`
+	IPHistory    map[string]map[string]IPSeen          `json:"ip_history"`
+	IPStability  map[string]map[string]IPStabilitySeen `json:"ip_stability"`
 }
 
 type APIClient struct {
@@ -781,6 +798,10 @@ func normalizeConfig(cfg *Config) {
 
 	if cfg.PenaltySeconds < 1 {
 		cfg.PenaltySeconds = 60
+	}
+
+	if cfg.IPStabilityChecks < 1 {
+		cfg.IPStabilityChecks = 2
 	}
 
 	if cfg.RequestTimeout < 1 {
@@ -1072,6 +1093,10 @@ func ensureStateMaps(state *RuntimeState) {
 
 	if state.IPHistory == nil {
 		state.IPHistory = make(map[string]map[string]IPSeen)
+	}
+
+	if state.IPStability == nil {
+		state.IPStability = make(map[string]map[string]IPStabilitySeen)
 	}
 }
 
@@ -1630,7 +1655,7 @@ func processUser(
 			state,
 			user,
 			userID,
-			len(ips),
+			ips,
 		)
 		return
 	}
@@ -1647,14 +1672,97 @@ func processUser(
 	}
 }
 
+func updateIPStability(
+	cfg *Config,
+	state *RuntimeState,
+	userID string,
+	ips map[string]struct{},
+) map[string]struct{} {
+	now := time.Now().Unix()
+
+	checksRequired := cfg.IPStabilityChecks
+	if checksRequired < 1 {
+		checksRequired = 1
+	}
+
+	maxAge := int64(checksRequired+1) * int64(cfg.CheckInterval)
+	if maxAge < 60 {
+		maxAge = 60
+	}
+
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	if state.IPStability == nil {
+		state.IPStability = make(map[string]map[string]IPStabilitySeen)
+	}
+
+	userIPs := state.IPStability[userID]
+	if userIPs == nil {
+		userIPs = make(map[string]IPStabilitySeen)
+		state.IPStability[userID] = userIPs
+	}
+
+	seenNow := make(map[string]struct{}, len(ips))
+
+	for ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+
+		seenNow[ip] = struct{}{}
+
+		seen, exists := userIPs[ip]
+		if !exists || seen.LastSeen <= 0 || now-seen.LastSeen > int64(cfg.CheckInterval)+15 {
+			seen = IPStabilitySeen{}
+		}
+
+		seen.Consecutive++
+		seen.LastSeen = now
+		userIPs[ip] = seen
+	}
+
+	// If an IP disappears from the current online snapshot, it is no longer
+	// counted as a simultaneous active connection. This prevents an old IP
+	// surviving a disconnect/reconnect from being counted with the new IP.
+	for ip, seen := range userIPs {
+		if _, ok := seenNow[ip]; !ok || now-seen.LastSeen > maxAge {
+			delete(userIPs, ip)
+		}
+	}
+
+	stable := make(map[string]struct{})
+	for ip, seen := range userIPs {
+		if seen.Consecutive >= checksRequired {
+			stable[ip] = struct{}{}
+		}
+	}
+
+	if len(userIPs) == 0 {
+		delete(state.IPStability, userID)
+	}
+
+	return stable
+}
+
 func processIPLimit(
 	client *APIClient,
 	cfg *Config,
 	state *RuntimeState,
 	user User,
 	userID string,
-	ipCount int,
+	ips map[string]struct{},
 ) {
+	stableIPs := updateIPStability(
+		cfg,
+		state,
+		userID,
+		ips,
+	)
+
+	ipCount := len(stableIPs)
+
 	if ipCount <= user.HWIDLimit {
 		clearGrace(
 			state,
@@ -2189,6 +2297,22 @@ func pruneState(
 
 	stateMu.Lock()
 	defer stateMu.Unlock()
+
+	stabilityMaxAge := int64(cfg.IPStabilityChecks+1) * int64(cfg.CheckInterval)
+	if stabilityMaxAge < 60 {
+		stabilityMaxAge = 60
+	}
+
+	for userID, ips := range state.IPStability {
+		for ip, seen := range ips {
+			if now-seen.LastSeen > stabilityMaxAge {
+				delete(ips, ip)
+			}
+		}
+		if len(ips) == 0 {
+			delete(state.IPStability, userID)
+		}
+	}
 
 	for userID, abuse :=
 		range state.Abuse {
@@ -3231,7 +3355,7 @@ BACKUP_DIR="$INSTALL_DIR/backups"
 
 SERVICE_NAME="pg_iplimit.service"
 
-CURRENT_VERSION="1.3.5"
+CURRENT_VERSION="1.3.6"
 
 INSTALLER_URL="https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh"
 
@@ -3907,6 +4031,52 @@ uninstall() {
         rm -rf "$INSTALL_DIR"
 }
 
+show_active_blocks() {
+    clear
+
+    echo -e "${CYAN}━━━━━━━━━━━━ Active TeperIP Blocks ━━━━━━━━━━━━${NC}"
+    echo
+
+    if [[ ! -f "$DB_FILE" ]]; then
+        echo "No TeperIP database found."
+        return 0
+    fi
+
+    local count=0 now remaining blocked_at duration username reason user_id
+    now="$(date +%s)"
+
+    while IFS=$'\t' read -r user_id username reason blocked_at duration; do
+        [[ -n "$user_id" ]] || continue
+        count=$((count + 1))
+
+        if [[ "$blocked_at" =~ ^[0-9]+$ && "$duration" =~ ^[0-9]+$ ]]; then
+            remaining=$((blocked_at + duration - now))
+            (( remaining < 0 )) && remaining=0
+        else
+            remaining="?"
+        fi
+
+        echo "#$count"
+        echo "  Username : ${username:-unknown}"
+        echo "  User ID  : $user_id"
+        echo "  Reason   : $reason"
+        echo "  Blocked  : $(date -d "@$blocked_at" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$blocked_at")"
+        echo "  Remaining: ${remaining}s"
+        echo
+    done < <(
+        sqlite3 -separator $'\t' "$DB_FILE" \
+            'SELECT user_id, username, reason, blocked_at, duration FROM disabled_users ORDER BY blocked_at DESC;' \
+            2>/dev/null || true
+    )
+
+    if ((count == 0)); then
+        echo "No users are currently disabled by TeperIP."
+    else
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo "Active TeperIP blocks: $count"
+    fi
+}
+
 while true; do
 
     clear
@@ -3924,6 +4094,7 @@ while true; do
     echo "8) Backup Config"
     echo "9) Uninstall"
     echo "10) Check for Updates"
+    echo "11) Active TeperIP Blocks"
     echo "0) Exit"
 
     echo
@@ -3982,6 +4153,11 @@ while true; do
 
         10)
             updates
+            ;;
+
+        11)
+            show_active_blocks
+            pause_menu
             ;;
 
         0)
