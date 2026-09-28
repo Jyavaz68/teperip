@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CURRENT_VERSION="1.3.4"
+CURRENT_VERSION="1.3.5"
 
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
@@ -1417,16 +1417,40 @@ func (a *APIClient) getJSON(
 }
 
 func (a *APIClient) getOnlineUsers() ([]User, error) {
-	var users []User
+	var raw json.RawMessage
 
 	if err := a.getJSON(
-		"/api/users?online=true",
-		&users,
+		"/api/users?online=true&all=true",
+		&raw,
 	); err != nil {
 		return nil, err
 	}
 
-	return users, nil
+	// Older PasarGuard versions returned a bare JSON array.
+	var users []User
+	if err := json.Unmarshal(raw, &users); err == nil {
+		return users, nil
+	}
+
+	// Current PasarGuard versions return an object containing `users`.
+	var envelope struct {
+		Users []User `json:"users"`
+	}
+
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf(
+			"decode /api/users?online=true: %w",
+			err,
+		)
+	}
+
+	if envelope.Users == nil {
+		return nil, fmt.Errorf(
+			"decode /api/users?online=true: response object does not contain users array",
+		)
+	}
+
+	return envelope.Users, nil
 }
 
 func (a *APIClient) getUserIPs(
@@ -3207,7 +3231,7 @@ BACKUP_DIR="$INSTALL_DIR/backups"
 
 SERVICE_NAME="pg_iplimit.service"
 
-CURRENT_VERSION="1.3.3"
+CURRENT_VERSION="1.3.5"
 
 INSTALLER_URL="https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh"
 
