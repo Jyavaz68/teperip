@@ -1,10 +1,10 @@
 # TeperIP 🚀
 
-**PasarGuard IP Limit Monitor**
+**PasarGuard IP Limit & Anti-Abuse Monitor**
 
-مانیتور سبک و خودکار محدودیت IP برای پنل **PasarGuard**.
+مانیتور سبک، خودکار و پیشرفته برای اعمال محدودیت IP و مقابله با سوءاستفاده (Anti-Abuse) در پنل **PasarGuard**.
 
-TeperIP کاربران آنلاین پنل را بررسی می‌کند و تعداد IPهای فعال هر کاربر را با مقدار `hwid_limit` مقایسه می‌کند.
+TeperIP کاربران آنلاین پنل را بررسی می‌کند، تعداد IPهای فعال هر کاربر را با مقدار `hwid_limit` مقایسه کرده و در صورت تخلف، کاربر را جریمه می‌کند.
 
 ---
 
@@ -12,31 +12,29 @@ TeperIP کاربران آنلاین پنل را بررسی می‌کند و تع
 
 ### ✨ امکانات
 
-- بررسی خودکار کاربران آنلاین PasarGuard
-- بررسی IPهای فعال کاربر روی تمام Nodeها
-- محاسبه IPهای یکتا
-- مقایسه تعداد IPها با `hwid_limit`
-- غیرفعال کردن خودکار کاربر در صورت عبور از محدودیت
-- فعال‌سازی مجدد کاربر بعد از مدت مشخص
-- بررسی دوره‌ای و خودکار
-- استفاده از چند Worker برای کاهش زمان بررسی
-- بررسی فقط کاربران آنلاین برای کاهش مصرف منابع
-- اجرای دائمی به صورت systemd service
-- منوی مدیریتی با دستور `teperip`
-- امکان مشاهده Live Logs
-- امکان Backup تنظیمات
-- امکان Restart / Start / Stop سرویس
-- امکان Uninstall کامل
+- بررسی خودکار کاربران آنلاین PasarGuard (فقط کاربران فعال برای کاهش مصرف منابع)
+- دریافت و محاسبه IPهای فعال و یکتای کاربر روی تمام Nodeها
+- مقایسه دقیق تعداد IPها با `hwid_limit`
+- **سیستم تلرانس (چشم‌پوشی زمانی):** جلوگیری از قطعی اشتباه کاربران به دلیل تغییر شبکه (مثل جابجایی از وای‌فای به دیتا)
+- **سیستم پیشرفته Anti-Abuse:** شناسایی هجوم IPهای جدید و بن کردن موقت متخلفین
+- **حفظ وضعیت (State Persistence):** ذخیره وضعیت جریمه‌ها و اخطارها حتی پس از ری‌استارت سرور
+- غیرفعال کردن خودکار کاربر متخلف و فعال‌سازی مجدد او پس از پایان زمان جریمه
+- استفاده از چندین Worker برای افزایش سرعت بررسی
+- اجرای پایدار به صورت systemd service
+- منوی مدیریتی تعاملی و قدرتمند با دستور `teperip`
+- **سیستم آپدیت‌چکر هوشمند:** امکان آپدیت مستقیم از گیت‌هاب بدون از دست رفتن تنظیمات فعلی
+- امکان مشاهده Live Logs، تهیه Backup، و ویرایش تنظیمات
+- امکان Uninstall کامل و تمیز
 
 ### 📥 نصب
 
 برای نصب فقط این دستور را روی سرور اجرا کنید:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
+curl -fsSL [https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh](https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh) -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
 ```
 
-نصب به صورت مرحله‌به‌مرحله انجام می‌شود و اطلاعات موردنیاز را از شما دریافت می‌کند.
+نصب به صورت مرحله‌به‌مرحله انجام می‌شود و اطلاعات موردنیاز را از شما دریافت می‌کند. (اگر از قبل نصب داشته باشید، تنظیمات شما به صورت خودکار حفظ می‌شود).
 
 ### 🔑 موارد موردنیاز
 
@@ -59,9 +57,10 @@ TeperIP به صورت خودکار:
 3. IPهای فعال هر کاربر را از Nodeها دریافت می‌کند.
 4. IPهای یکتا را محاسبه می‌کند.
 5. تعداد IPها را با `hwid_limit` مقایسه می‌کند.
-6. در صورت عبور از محدودیت، کاربر را غیرفعال می‌کند.
-7. بعد از مدت تعیین‌شده، کاربر را مجدداً فعال می‌کند.
-8. این فرآیند را به صورت دوره‌ای تکرار می‌کند.
+6. **قانون تلرانس:** در صورت عبور از محدودیت، به کاربر زمان کوتاهی فرصت می‌دهد تا مشکل نشست‌های معلق برطرف شود.
+7. در صورت پابرجا بودن تخلف، کاربر را غیرفعال می‌کند.
+8. بعد از مدت تعیین‌شده، کاربر را مجدداً فعال می‌کند.
+9. در صورت فعال بودن Anti-Abuse، رفتارهای مشکوک کاربر ثبت شده و جریمه‌های سنگین‌تری در نظر گرفته می‌شود.
 
 > فقط کاربران آنلاین بررسی می‌شوند تا تعداد درخواست‌های API و مصرف منابع کاهش پیدا کند.
 
@@ -80,8 +79,9 @@ teperip
 - سرویس را Restart کنید
 - سرویس را Start کنید
 - سرویس را Stop کنید
-- تنظیمات را ویرایش کنید
+- تنظیمات کانفیگ و Anti-Abuse را ویرایش کنید
 - از تنظیمات Backup بگیرید
+- آپدیت‌های جدید گیت‌هاب را بررسی کنید
 - TeperIP را Uninstall کنید
 
 ### 📋 مشاهده لاگ
@@ -101,6 +101,10 @@ journalctl -u pg_iplimit.service -f
 فایل تنظیمات:
 
 `/opt/pg_iplimit/config.json`
+
+فایل حفظ وضعیت:
+
+`/opt/pg_iplimit/runtime_state.json`
 
 باینری:
 
@@ -122,7 +126,7 @@ journalctl -u pg_iplimit.service -f
 teperip
 ```
 
-سپس گزینه **Uninstall** را انتخاب کنید.
+سپس گزینه **Uninstall** را انتخاب کنید و کلمه `REMOVE` را برای تایید تایپ کنید.
 
 ---
 
@@ -134,27 +138,25 @@ teperip
 - Checks active IPs across all nodes
 - Counts unique active IP addresses
 - Compares IP count with `hwid_limit`
-- Automatically disables users exceeding their IP limit
-- Automatically re-enables users after the configured penalty period
-- Periodic automatic checking
-- Concurrent workers for faster checks
-- Checks only currently online users
-- Runs as a systemd service
-- Management menu with `teperip`
-- Live log monitoring
-- Configuration backup
-- Start / Stop / Restart controls
-- Full uninstall support
+- **Grace Period / Tolerance:** Prevents false positives during network changes
+- **Advanced Anti-Abuse Protection:** Detects sudden bursts of new IPs and temporarily bans serial offenders
+- **State Persistence:** Preserves user penalties and warnings even after a server reboot
+- Automatically disables users exceeding their limits and re-enables them after the penalty period
+- Periodic automatic checking with concurrent workers
+- Runs as a robust background systemd service
+- Interactive management menu via the `teperip` command
+- **Smart Update Checker:** Pulls the latest version from GitHub automatically without losing configs
+- Live log monitoring, config backups, and full uninstall support
 
 ### 📥 Installation
 
 Run this command on your Linux server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
+curl -fsSL [https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh](https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh) -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
 ```
 
-The installer will guide you through the setup step by step and ask for the required information.
+The installer will guide you through the setup. If an existing installation is detected, your panel credentials and runtime state will be automatically preserved.
 
 ### 🔑 Requirements
 
@@ -170,18 +172,18 @@ TeperIP:
 
 1. Connects to the PasarGuard API.
 2. Retrieves currently online users.
-3. Retrieves active IPs for each online user.
+3. Retrieves active IPs for each online user across all nodes.
 4. Counts unique IP addresses.
-5. Compares the count with `hwid_limit`.
-6. Disables users who exceed their configured limit.
-7. Re-enables users after the configured penalty period.
-8. Repeats the process automatically.
+5. Compares the count with the user's `hwid_limit`.
+6. Enforces tolerance rules (giving ghost sessions time to drop) before taking action.
+7. Disables users who genuinely exceed limits and re-enables them after the penalty period.
+8. Triggers the Anti-Abuse system for suspicious IP hopping behaviors.
 
-> Only currently online users are checked to reduce unnecessary API requests and resource usage.
+> Only currently online users are checked to reduce unnecessary API requests and minimize resource usage.
 
 ### 🛠️ Management
 
-After installation:
+After installation, simply type:
 
 ```bash
 teperip
@@ -191,11 +193,10 @@ The management menu provides:
 
 - Service Status
 - Live Logs
-- Restart Service
-- Start Service
-- Stop Service
-- Edit Configuration
+- Restart / Start / Stop Service
+- Edit Config & Anti-Abuse Settings
 - Backup Configuration
+- Check for Updates
 - Uninstall
 
 ### 📋 Live Logs
@@ -209,6 +210,10 @@ journalctl -u pg_iplimit.service -f
 Configuration:
 
 `/opt/pg_iplimit/config.json`
+
+Runtime State:
+
+`/opt/pg_iplimit/runtime_state.json`
 
 Binary:
 
@@ -230,7 +235,7 @@ Run:
 teperip
 ```
 
-Then select **Uninstall**.
+Then select **Uninstall** and confirm by typing `REMOVE`.
 
 ---
 
@@ -239,11 +244,3 @@ Then select **Uninstall**.
 GitHub:
 
 https://github.com/Jyavaz68/teperip
-
-## ⚠️ Disclaimer
-
-این پروژه برای مدیریت و کنترل محدودیت IP کاربران PasarGuard طراحی شده است.
-
-قبل از استفاده در محیط Production، ابتدا آن را روی یک سرور تست کنید.
-
-**Use at your own risk.**
