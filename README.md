@@ -31,7 +31,7 @@ TeperIP کاربران آنلاین پنل را بررسی می‌کند، تع�
 برای نصب فقط این دستور را روی سرور اجرا کنید:
 
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh](https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh) -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
+curl -fsSL https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
 ```
 
 نصب به صورت مرحله‌به‌مرحله انجام می‌شود و اطلاعات موردنیاز را از شما دریافت می‌کند. (اگر از قبل نصب داشته باشید، تنظیمات شما به صورت خودکار حفظ می‌شود).
@@ -153,7 +153,7 @@ teperip
 Run this command on your Linux server:
 
 ```bash
-curl -fsSL [https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh](https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh) -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
+curl -fsSL https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh -o /tmp/teperip-install.sh && sed -i 's/\r$//' /tmp/teperip-install.sh && chmod +x /tmp/teperip-install.sh && bash /tmp/teperip-install.sh
 ```
 
 The installer will guide you through the setup. If an existing installation is detected, your panel credentials and runtime state will be automatically preserved.
