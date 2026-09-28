@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CURRENT_VERSION="1.3.3"
+CURRENT_VERSION="1.3.4"
 
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
 STATE_FILE="$INSTALL_DIR/runtime_state.json"
+DB_FILE="$INSTALL_DIR/teperip.db"
 GO_SRC_FILE="$INSTALL_DIR/main.go"
 GO_MOD_FILE="$INSTALL_DIR/go.mod"
 BINARY_FILE="$INSTALL_DIR/pg_ip_limit"
@@ -64,7 +65,7 @@ ensure_dependencies() {
     local missing=()
     local cmd
 
-    for cmd in curl jq systemctl awk sed grep tar; do
+    for cmd in curl jq systemctl awk sed grep tar sqlite3; do
         command_exists "$cmd" || missing+=("$cmd")
     done
 
@@ -77,11 +78,11 @@ ensure_dependencies() {
     if command_exists apt-get; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
-        apt-get install -y curl jq systemd coreutils tar ca-certificates
+        apt-get install -y curl jq sqlite3 systemd coreutils tar ca-certificates
     elif command_exists dnf; then
-        dnf install -y curl jq systemd coreutils tar ca-certificates
+        dnf install -y curl jq sqlite systemd coreutils tar ca-certificates
     elif command_exists yum; then
-        yum install -y curl jq systemd coreutils tar ca-certificates
+        yum install -y curl jq sqlite systemd coreutils tar ca-certificates
     else
         err "Supported package manager not found."
         exit 1
@@ -280,6 +281,7 @@ backup_existing() {
 
     if [[ ! -f "$CONFIG_FILE" &&
           ! -f "$STATE_FILE" &&
+          ! -f "$DB_FILE" &&
           ! -f "$BINARY_FILE" ]]; then
         return 0
     fi
@@ -292,6 +294,7 @@ backup_existing() {
     for f in \
         config.json \
         runtime_state.json \
+        teperip.db \
         main.go \
         go.mod \
         .install_state.json
@@ -506,6 +509,80 @@ JSON
     fi
 }
 
+initialize_database() {
+    if [[ ! -f "$DB_FILE" ]]; then
+        log "Creating TeperIP SQLite database..."
+    else
+        log "Checking TeperIP SQLite database..."
+    fi
+
+    sqlite3 "$DB_FILE" <<'SQL'
+PRAGMA journal_mode=DELETE;
+PRAGMA synchronous=FULL;
+
+CREATE TABLE IF NOT EXISTS disabled_users (
+    user_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL,
+    blocked_at INTEGER NOT NULL,
+    duration INTEGER NOT NULL
+);
+SQL
+
+    chmod 600 "$DB_FILE"
+}
+
+migrate_blocked_users_to_database() {
+    [[ -f "$STATE_FILE" ]] || return 0
+    [[ -f "$DB_FILE" ]] || return 0
+
+    if ! jq -e '.blocked_users | type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local count=0
+    local user_id blocked_at duration abuse_ban reason
+
+    while IFS=$'\t' read -r user_id blocked_at duration abuse_ban; do
+        [[ -n "$user_id" ]] || continue
+        [[ "$blocked_at" =~ ^[0-9]+$ ]] || continue
+        [[ "$duration" =~ ^[0-9]+$ ]] || continue
+
+        if [[ "$abuse_ban" == "true" ]]; then
+            reason="anti_abuse"
+        else
+            reason="ip_limit"
+        fi
+
+        sqlite3 "$DB_FILE"             "INSERT OR IGNORE INTO disabled_users
+             (user_id, username, reason, blocked_at, duration)
+             VALUES ($(printf '%s' "$user_id" | sed "s/'/''/g" | sed "s/^/'/;s/$/'/"),
+                     '',
+                     '$reason',
+                     $blocked_at,
+                     $duration);"
+
+        count=$((count + 1))
+    done < <(
+        jq -r '
+            .blocked_users
+            | to_entries[]
+            | [
+                (.key | tostring),
+                (.value.blocked_at // 0),
+                (.value.duration_seconds // 0),
+                (.value.abuse_ban // false)
+              ]
+            | @tsv
+        ' "$STATE_FILE" 2>/dev/null || true
+    )
+
+    if ((count > 0)); then
+        chmod 600 "$DB_FILE"
+        ok "Migrated $count active TeperIP block(s) into SQLite."
+    fi
+}
+
 write_go_source() {
 cat > "$GO_SRC_FILE" <<'GO'
 package main
@@ -514,7 +591,9 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
+	"os/exec"
 	"fmt"
 	"io"
 	"log"
@@ -607,8 +686,10 @@ type APIClient struct {
 var (
 	configPath = "/opt/pg_iplimit/config.json"
 	statePath  = "/opt/pg_iplimit/runtime_state.json"
+	databasePath = "/opt/pg_iplimit/teperip.db"
 
 	stateMu = sync.Mutex{}
+	dbMu    = sync.Mutex{}
 
 	logger = log.New(os.Stdout, "", log.LstdFlags)
 )
@@ -627,6 +708,19 @@ func main() {
 	}
 
 	ensureStateMaps(&state)
+
+	if err := initDatabase(); err != nil {
+		logger.Fatalf("database error: %v", err)
+	}
+
+	activeBlocks, err := loadActiveBlocks()
+	if err != nil {
+		logger.Fatalf("database load error: %v", err)
+	}
+
+	stateMu.Lock()
+	state.BlockedUsers = activeBlocks
+	stateMu.Unlock()
 
 	client, err := newAPIClient(cfg)
 	if err != nil {
@@ -752,6 +846,195 @@ func loadConfig(path string) (Config, error) {
 	)
 
 	return cfg, nil
+}
+
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func initDatabase() error {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	sql := `
+PRAGMA journal_mode=DELETE;
+PRAGMA synchronous=FULL;
+CREATE TABLE IF NOT EXISTS disabled_users (
+	user_id TEXT PRIMARY KEY,
+	username TEXT NOT NULL DEFAULT '',
+	reason TEXT NOT NULL,
+	blocked_at INTEGER NOT NULL,
+	duration INTEGER NOT NULL
+);`
+
+	cmd := exec.Command(
+		"sqlite3",
+		"-batch",
+		databasePath,
+		sql,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"sqlite init failed: %v: %s",
+			err,
+			trimBody(output),
+		)
+	}
+
+	if err := os.Chmod(databasePath, 0600); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func saveActiveBlock(
+	userID string,
+	username string,
+	block BlockedUser,
+	reason string,
+) error {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	sql := fmt.Sprintf(
+		`INSERT OR REPLACE INTO disabled_users
+		 (user_id, username, reason, blocked_at, duration)
+		 VALUES (%s, %s, %s, %d, %d);`,
+		sqlQuote(userID),
+		sqlQuote(username),
+		sqlQuote(reason),
+		block.BlockedAt,
+		block.Duration,
+	)
+
+	cmd := exec.Command(
+		"sqlite3",
+		"-batch",
+		databasePath,
+		sql,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"sqlite save block failed: %v: %s",
+			err,
+			trimBody(output),
+		)
+	}
+
+	return nil
+}
+
+func deleteActiveBlock(userID string) error {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	sql := fmt.Sprintf(
+		"DELETE FROM disabled_users WHERE user_id=%s;",
+		sqlQuote(userID),
+	)
+
+	cmd := exec.Command(
+		"sqlite3",
+		"-batch",
+		databasePath,
+		sql,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"sqlite delete block failed: %v: %s",
+			err,
+			trimBody(output),
+		)
+	}
+
+	return nil
+}
+
+func loadActiveBlocks() (map[string]BlockedUser, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	cmd := exec.Command(
+		"sqlite3",
+		"-batch",
+		"-noheader",
+		"-separator", "|",
+		databasePath,
+		`SELECT hex(user_id),
+		        reason,
+		        blocked_at,
+		        duration
+		   FROM disabled_users
+		  ORDER BY blocked_at ASC;`,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"sqlite load blocks failed: %v: %s",
+			err,
+			trimBody(output),
+		)
+	}
+
+	blocks := make(map[string]BlockedUser)
+
+	for _, line := range strings.Split(
+		strings.TrimSpace(string(output)),
+		"\n",
+	) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, "|")
+		if len(parts) != 4 {
+			return nil, fmt.Errorf(
+				"invalid sqlite block row: %q",
+				line,
+			)
+		}
+
+		rawID, err := hex.DecodeString(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid sqlite user id: %w",
+				err,
+			)
+		}
+
+		blockedAt, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid sqlite blocked_at: %w",
+				err,
+			)
+		}
+
+		duration, err := strconv.ParseInt(parts[3], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid sqlite duration: %w",
+				err,
+			)
+		}
+
+		blocks[string(rawID)] = BlockedUser{
+			BlockedAt: blockedAt,
+			Duration:  duration,
+			AbuseBan:  parts[1] == "anti_abuse",
+		}
+	}
+
+	return blocks, nil
 }
 
 func loadState(path string) (RuntimeState, error) {
@@ -1408,6 +1691,12 @@ func processIPLimit(
 		return
 	}
 
+	block := BlockedUser{
+		BlockedAt: now,
+		Duration:  int64(cfg.PenaltySeconds),
+		AbuseBan: false,
+	}
+
 	if err := client.setDisabled(
 		userID,
 		true,
@@ -1420,14 +1709,29 @@ func processIPLimit(
 		return
 	}
 
-	stateMu.Lock()
-
-	state.BlockedUsers[userID] = BlockedUser{
-		BlockedAt: now,
-		Duration:  int64(cfg.PenaltySeconds),
-		AbuseBan: false,
+	if err := saveActiveBlock(
+		userID,
+		user.Username,
+		block,
+		"ip_limit",
+	); err != nil {
+		if enableErr := client.setDisabled(userID, false); enableErr != nil {
+			logger.Printf(
+				"IP LIMIT | user=%s database save failed and rollback re-enable failed: %v",
+				userID,
+				enableErr,
+			)
+		} else {
+			logger.Printf(
+				"IP LIMIT | user=%s database save failed; disable rolled back",
+				userID,
+			)
+		}
+		return
 	}
 
+	stateMu.Lock()
+	state.BlockedUsers[userID] = block
 	stateMu.Unlock()
 
 	logger.Printf(
@@ -1617,6 +1921,12 @@ func processAntiAbuse(
 
 	stateMu.Unlock()
 
+	block := BlockedUser{
+		BlockedAt: now,
+		Duration:  int64(cfg.AntiAbuse.BanSeconds),
+		AbuseBan: true,
+	}
+
 	if err := client.setDisabled(
 		userID,
 		true,
@@ -1631,13 +1941,30 @@ func processAntiAbuse(
 		return
 	}
 
+	if err := saveActiveBlock(
+		userID,
+		user.Username,
+		block,
+		"anti_abuse",
+	); err != nil {
+		if enableErr := client.setDisabled(userID, false); enableErr != nil {
+			logger.Printf(
+				"ANTI-ABUSE | user=%s database save failed and rollback re-enable failed: %v",
+				userID,
+				enableErr,
+			)
+		} else {
+			logger.Printf(
+				"ANTI-ABUSE | user=%s database save failed; disable rolled back",
+				userID,
+			)
+		}
+		return
+	}
+
 	stateMu.Lock()
 
-	state.BlockedUsers[userID] = BlockedUser{
-		BlockedAt: now,
-		Duration:  int64(cfg.AntiAbuse.BanSeconds),
-		AbuseBan: true,
-	}
+	state.BlockedUsers[userID] = block
 
 	abuse = state.Abuse[userID]
 
@@ -1743,48 +2070,44 @@ func processExpiredBlocks(
 ) {
 	now := time.Now().Unix()
 
-	type expiredEntry struct {
-		ID string
-		B  BlockedUser
+	blocks, err := loadActiveBlocks()
+	if err != nil {
+		logger.Printf(
+			"RE-ENABLE | failed to load active blocks: %v",
+			err,
+		)
+		return
 	}
-
-	var expired []expiredEntry
 
 	stateMu.Lock()
-
-	for id, block :=
-		range state.BlockedUsers {
-
-		if block.BlockedAt <= 0 ||
-			block.Duration <= 0 ||
-			now-block.BlockedAt >= block.Duration {
-
-			expired =
-				append(
-					expired,
-					expiredEntry{
-						ID: id,
-						B:  block,
-					},
-				)
-		}
-	}
-
+	state.BlockedUsers = blocks
 	stateMu.Unlock()
 
-	for _, item := range expired {
+	for id, block := range blocks {
+		if block.BlockedAt > 0 &&
+			block.Duration > 0 &&
+			now-block.BlockedAt < block.Duration {
+			continue
+		}
 
 		if err := client.setDisabled(
-			item.ID,
+			id,
 			false,
 		); err != nil {
-
 			logger.Printf(
 				"RE-ENABLE | user=%s failed: %v",
-				item.ID,
+				id,
 				err,
 			)
+			continue
+		}
 
+		if err := deleteActiveBlock(id); err != nil {
+			logger.Printf(
+				"RE-ENABLE | user=%s enabled but database cleanup failed: %v",
+				id,
+				err,
+			)
 			continue
 		}
 
@@ -1792,25 +2115,25 @@ func processExpiredBlocks(
 
 		delete(
 			state.BlockedUsers,
-			item.ID,
+			id,
 		)
 
 		delete(
 			state.Abuse,
-			item.ID,
+			id,
 		)
 
 		stateMu.Unlock()
 
-		if item.B.AbuseBan {
+		if block.AbuseBan {
 			logger.Printf(
 				"ANTI-ABUSE | user=%s temporary ban expired; user re-enabled",
-				item.ID,
+				id,
 			)
 		} else {
 			logger.Printf(
 				"IP LIMIT | user=%s penalty expired; user re-enabled",
-				item.ID,
+				id,
 			)
 		}
 	}
@@ -3716,6 +4039,9 @@ install_all() {
 
     create_initial_state
 
+    initialize_database
+    migrate_blocked_users_to_database
+
     write_go_source
 
     build_binary
@@ -3744,6 +4070,7 @@ install_all() {
     echo "Service:    $SERVICE_NAME"
     echo "Config:     $CONFIG_FILE"
     echo "State:      $STATE_FILE"
+    echo "Database:   $DB_FILE"
 
     echo -e \
         "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
