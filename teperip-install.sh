@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CURRENT_VERSION="1.3.6"
+CURRENT_VERSION="1.4.0"
 
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
@@ -55,6 +55,14 @@ pause_menu() {
 
 normalize_url() {
     echo "${1%/}"
+}
+
+generate_token() {
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+is_uint() {
+    [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 is_valid_url() {
@@ -328,6 +336,7 @@ migrate_config() {
 
     jq \
         --arg version "$CURRENT_VERSION" \
+        --arg new_token "$(generate_token)" \
         '
         .version = $version |
 
@@ -337,7 +346,7 @@ migrate_config() {
 
         .check_interval = (.check_interval // 30) |
         .tolerance_seconds = (.tolerance_seconds // 60) |
-        .penalty_seconds = (.penalty_seconds // 60) |
+        .penalty_seconds = (.penalty_seconds // 300) |
         .ip_stability_checks = (.ip_stability_checks // 2) |
 
         .request_timeout = (.request_timeout // 15) |
@@ -345,7 +354,7 @@ migrate_config() {
         .verbose = (.verbose // false) |
 
         .anti_abuse = ((.anti_abuse // {}) + {
-            enabled: ((.anti_abuse.enabled // true)),
+            enabled: (if .anti_abuse.enabled == null then true else .anti_abuse.enabled end),
             new_ip_threshold: ((.anti_abuse.new_ip_threshold // 20)),
             new_ip_window_seconds: ((.anti_abuse.new_ip_window_seconds // 60)),
             strike_threshold: ((.anti_abuse.strike_threshold // 3)),
@@ -356,7 +365,21 @@ migrate_config() {
         }) |
 
         .journal_max_size = (.journal_max_size // "50M") |
-        .journal_max_file_size = (.journal_max_file_size // "10M")
+        .journal_max_file_size = (.journal_max_file_size // "10M") |
+
+        .insecure_skip_verify = (if .insecure_skip_verify == null then true else .insecure_skip_verify end) |
+
+        .kick = ((.kick // {}) + {
+            mode: (.kick.mode // "off"),
+            agent_port: (.kick.agent_port // 8765),
+            agent_token: (if (.kick.agent_token // "") == "" then $new_token else .kick.agent_token end),
+            extra_agents: (.kick.extra_agents // []),
+            block_ip: (if .kick.block_ip == null then true else .kick.block_ip end),
+            kill_sockets: (if .kick.kill_sockets == null then true else .kick.kill_sockets end),
+            max_block_seconds: (.kick.max_block_seconds // 3600),
+            timeout_seconds: (.kick.timeout_seconds // 5),
+            master_ip: (.kick.master_ip // "")
+        })
         ' \
         "$CONFIG_FILE" > "$tmp_file"
 
@@ -426,7 +449,7 @@ prompt_config() {
     )"
 
     penalty="$(
-        jq -r '.penalty_seconds // 60' "$CONFIG_FILE" 2>/dev/null || echo 60
+        jq -r '.penalty_seconds // 300' "$CONFIG_FILE" 2>/dev/null || echo 300
     )"
 
     stability_checks="$(
@@ -459,14 +482,42 @@ prompt_config() {
     read -r -p "Number of Workers [$workers]: " input
     workers="${input:-$workers}"
 
-    jq -n \
+    local value
+    for value in \
+        "$check_interval" \
+        "$tolerance" \
+        "$penalty" \
+        "$stability_checks" \
+        "$timeout" \
+        "$workers"
+    do
+        if ! is_uint "$value"; then
+            err "Numeric settings must be non-negative integers (got: '$value')."
+            exit 1
+        fi
+    done
+
+    # Normalize values such as "08" which are not valid JSON numbers.
+    check_interval=$((10#$check_interval))
+    tolerance=$((10#$tolerance))
+    penalty=$((10#$penalty))
+    stability_checks=$((10#$stability_checks))
+    timeout=$((10#$timeout))
+    workers=$((10#$workers))
+
+    local tmp_config
+    tmp_config="$(mktemp)"
+
+    if ! jq -n \
         --arg version "$CURRENT_VERSION" \
         --arg panel_url "$panel_url" \
         --arg panel_user "$panel_user" \
         --arg panel_pass "$panel_pass" \
+        --arg agent_token "$(generate_token)" \
         --argjson check_interval "$check_interval" \
         --argjson tolerance_seconds "$tolerance" \
         --argjson penalty_seconds "$penalty" \
+        --argjson ip_stability_checks "$stability_checks" \
         --argjson request_timeout "$timeout" \
         --argjson max_workers "$workers" \
         '{
@@ -484,6 +535,8 @@ prompt_config() {
             max_workers: $max_workers,
             verbose: false,
 
+            insecure_skip_verify: true,
+
             anti_abuse: {
                 enabled: true,
                 new_ip_threshold: 20,
@@ -495,11 +548,29 @@ prompt_config() {
                 max_events_per_user: 1000
             },
 
+            kick: {
+                mode: "off",
+                agent_port: 8765,
+                agent_token: $agent_token,
+                extra_agents: [],
+                block_ip: true,
+                kill_sockets: true,
+                max_block_seconds: 3600,
+                timeout_seconds: 5,
+                master_ip: ""
+            },
+
             journal_max_size: "50M",
             journal_max_file_size: "10M"
-        }' > "$CONFIG_FILE"
+        }' > "$tmp_config"
+    then
+        rm -f "$tmp_config"
+        err "Failed to build config.json."
+        exit 1
+    fi
 
-    chmod 600 "$CONFIG_FILE"
+    chmod 600 "$tmp_config"
+    mv "$tmp_config" "$CONFIG_FILE"
 }
 
 create_initial_state() {
@@ -599,22 +670,27 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
-	"os/exec"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -634,6 +710,22 @@ type Config struct {
 	AntiAbuse          AntiAbuseConfig `json:"anti_abuse"`
 	JournalMaxSize     string          `json:"journal_max_size"`
 	JournalMaxFileSize string          `json:"journal_max_file_size"`
+
+	// nil means "not set" and is treated as true for backward compatibility.
+	InsecureSkipVerify *bool      `json:"insecure_skip_verify"`
+	Kick               KickConfig `json:"kick"`
+}
+
+type KickConfig struct {
+	Mode            string   `json:"mode"`
+	AgentPort       int      `json:"agent_port"`
+	AgentToken      string   `json:"agent_token"`
+	ExtraAgents     []string `json:"extra_agents"`
+	BlockIP         *bool    `json:"block_ip"`
+	KillSockets     *bool    `json:"kill_sockets"`
+	MaxBlockSeconds int      `json:"max_block_seconds"`
+	TimeoutSeconds  int      `json:"timeout_seconds"`
+	MasterIP        string   `json:"master_ip"`
 }
 
 type AntiAbuseConfig struct {
@@ -667,11 +759,16 @@ type IPSeen struct {
 type IPStabilitySeen struct {
 	Consecutive int   `json:"consecutive"`
 	LastSeen    int64 `json:"last_seen"`
+	LastCycle   int64 `json:"last_cycle"`
 }
 
 type UserAbuseState struct {
 	NewIPs  []AbuseEvent `json:"new_ips"`
 	Strikes []AbuseEvent `json:"strikes"`
+
+	// Start of the IP-limit grace period. Kept apart from Strikes so it can
+	// never be mistaken for a real anti-abuse strike.
+	GraceStart int64 `json:"grace_start"`
 }
 
 type BlockedUser struct {
@@ -709,6 +806,12 @@ var (
 	dbMu    = sync.Mutex{}
 
 	logger = log.New(os.Stdout, "", log.LstdFlags)
+
+	// Incremented once per successful cycle; used by the IP stability logic.
+	cycleCounter int64
+
+	kickMu   sync.Mutex
+	kickLast = make(map[string]int64)
 )
 
 func main() {
@@ -719,12 +822,19 @@ func main() {
 
 	normalizeConfig(&cfg)
 
+	if len(os.Args) > 1 {
+		os.Exit(runCLI(cfg, os.Args[1:]))
+	}
+
 	state, err := loadState(statePath)
 	if err != nil {
 		logger.Fatalf("state error: %v", err)
 	}
 
 	ensureStateMaps(&state)
+
+	// Stability counters are cycle based; they are meaningless across restarts.
+	state.IPStability = make(map[string]map[string]IPStabilitySeen)
 
 	if err := initDatabase(); err != nil {
 		logger.Fatalf("database error: %v", err)
@@ -751,6 +861,24 @@ func main() {
 		cfg.MaxWorkers,
 		cfg.AntiAbuse.Enabled,
 	)
+
+	if cfg.insecureSkipVerify() {
+		logger.Printf(
+			"WARNING: TLS certificate verification for the panel is disabled " +
+				"(insecure_skip_verify=true). Set it to false in config.json if " +
+				"your panel has a valid certificate.",
+		)
+	}
+
+	if cfg.Kick.Mode == "agents" {
+		logger.Printf(
+			"KICK enabled | agent_port=%d block_ip=%t kill_sockets=%t extra_agents=%d",
+			cfg.Kick.AgentPort,
+			boolOr(cfg.Kick.BlockIP, true),
+			boolOr(cfg.Kick.KillSockets, true),
+			len(cfg.Kick.ExtraAgents),
+		)
+	}
 
 	if err := client.login(); err != nil {
 		logger.Printf("initial login failed: %v", err)
@@ -797,7 +925,7 @@ func normalizeConfig(cfg *Config) {
 	}
 
 	if cfg.PenaltySeconds < 1 {
-		cfg.PenaltySeconds = 60
+		cfg.PenaltySeconds = 300
 	}
 
 	if cfg.IPStabilityChecks < 1 {
@@ -838,6 +966,22 @@ func normalizeConfig(cfg *Config) {
 
 	if cfg.AntiAbuse.MaxEventsPerUser < 10 {
 		cfg.AntiAbuse.MaxEventsPerUser = 1000
+	}
+
+	if cfg.Kick.Mode != "agents" {
+		cfg.Kick.Mode = "off"
+	}
+
+	if cfg.Kick.AgentPort < 1 || cfg.Kick.AgentPort > 65535 {
+		cfg.Kick.AgentPort = 8765
+	}
+
+	if cfg.Kick.MaxBlockSeconds < 1 {
+		cfg.Kick.MaxBlockSeconds = 3600
+	}
+
+	if cfg.Kick.TimeoutSeconds < 1 {
+		cfg.Kick.TimeoutSeconds = 5
 	}
 }
 
@@ -1098,6 +1242,26 @@ func ensureStateMaps(state *RuntimeState) {
 	if state.IPStability == nil {
 		state.IPStability = make(map[string]map[string]IPStabilitySeen)
 	}
+
+	// Older versions stored the grace start as a fake strike. Move it.
+	for userID, abuse := range state.Abuse {
+		kept := abuse.Strikes[:0]
+
+		for _, event := range abuse.Strikes {
+			if event.IP == "__ip_limit_grace__" {
+				if abuse.GraceStart == 0 {
+					abuse.GraceStart = event.Time
+				}
+
+				continue
+			}
+
+			kept = append(kept, event)
+		}
+
+		abuse.Strikes = kept
+		state.Abuse[userID] = abuse
+	}
 }
 
 func saveState(state *RuntimeState) error {
@@ -1180,7 +1344,7 @@ func newAPIClient(cfg Config) (*APIClient, error) {
 
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
+			InsecureSkipVerify: cfg.insecureSkipVerify(),
 		},
 		Proxy: http.ProxyFromEnvironment,
 	}
@@ -1579,6 +1743,22 @@ func runCycle(
 		return
 	}
 
+	atomic.AddInt64(&cycleCounter, 1)
+
+	online := make(map[string]struct{}, len(users))
+
+	for _, u := range users {
+		if id := stringifyID(u.ID); id != "" {
+			online[id] = struct{}{}
+		}
+	}
+
+	// Users that are no longer online must not keep stale grace periods or
+	// IP stability counters around.
+	cleanupOffline(state, online)
+
+	stats := &cycleStats{}
+
 	sem := make(
 		chan struct{},
 		cfg.MaxWorkers,
@@ -1604,11 +1784,26 @@ func runCycle(
 				cfg,
 				state,
 				user,
+				stats,
 			)
 		}()
 	}
 
 	wg.Wait()
+
+	if stats.failed > 0 {
+		logger.Printf(
+			"CYCLE | online=%d ip_lookup_failed=%d first_error=%s",
+			len(users),
+			stats.failed,
+			stats.firstErr,
+		)
+	} else if cfg.Verbose {
+		logger.Printf(
+			"CYCLE | online=%d ok",
+			len(users),
+		)
+	}
 
 	pruneState(
 		cfg,
@@ -1628,6 +1823,7 @@ func processUser(
 	cfg *Config,
 	state *RuntimeState,
 	user User,
+	stats *cycleStats,
 ) {
 	userID := stringifyID(user.ID)
 
@@ -1638,6 +1834,8 @@ func processUser(
 	ips, err := client.getUserIPs(userID)
 
 	if err != nil {
+		stats.fail(err)
+
 		if cfg.Verbose {
 			logger.Printf(
 				"user=%s IP lookup failed: %v",
@@ -1645,6 +1843,24 @@ func processUser(
 				err,
 			)
 		}
+		return
+	}
+
+	stateMu.Lock()
+	_, blocked := state.BlockedUsers[userID]
+	stateMu.Unlock()
+
+	if blocked {
+		// Already disabled by us. If the user is still online their old
+		// connections are alive, so try to cut them again.
+		maybeRekick(
+			client,
+			cfg,
+			state,
+			userID,
+			user.Username,
+			ips,
+		)
 		return
 	}
 
@@ -1659,6 +1875,9 @@ func processUser(
 		)
 		return
 	}
+
+	// The limit may have been removed in the panel during a grace period.
+	clearGrace(state, userID)
 
 	if cfg.AntiAbuse.Enabled {
 		processAntiAbuse(
@@ -1678,16 +1897,12 @@ func updateIPStability(
 	userID string,
 	ips map[string]struct{},
 ) map[string]struct{} {
+	cycle := atomic.LoadInt64(&cycleCounter)
 	now := time.Now().Unix()
 
 	checksRequired := cfg.IPStabilityChecks
 	if checksRequired < 1 {
 		checksRequired = 1
-	}
-
-	maxAge := int64(checksRequired+1) * int64(cfg.CheckInterval)
-	if maxAge < 60 {
-		maxAge = 60
 	}
 
 	stateMu.Lock()
@@ -1713,26 +1928,32 @@ func updateIPStability(
 
 		seenNow[ip] = struct{}{}
 
+		// "Consecutive" counts consecutive monitoring cycles, not seconds, so a
+		// slow cycle can never reset the counter.
 		seen, exists := userIPs[ip]
-		if !exists || seen.LastSeen <= 0 || now-seen.LastSeen > int64(cfg.CheckInterval)+15 {
+		if !exists || cycle < seen.LastCycle || cycle-seen.LastCycle > 1 {
 			seen = IPStabilitySeen{}
 		}
 
-		seen.Consecutive++
+		if seen.LastCycle != cycle {
+			seen.Consecutive++
+		}
+
+		seen.LastCycle = cycle
 		seen.LastSeen = now
 		userIPs[ip] = seen
 	}
 
-	// If an IP disappears from the current online snapshot, it is no longer
-	// counted as a simultaneous active connection. This prevents an old IP
-	// surviving a disconnect/reconnect from being counted with the new IP.
-	for ip, seen := range userIPs {
-		if _, ok := seenNow[ip]; !ok || now-seen.LastSeen > maxAge {
+	// An IP that disappears from the online snapshot is no longer a
+	// simultaneous connection.
+	for ip := range userIPs {
+		if _, ok := seenNow[ip]; !ok {
 			delete(userIPs, ip)
 		}
 	}
 
 	stable := make(map[string]struct{})
+
 	for ip, seen := range userIPs {
 		if seen.Consecutive >= checksRequired {
 			stable[ip] = struct{}{}
@@ -1866,6 +2087,16 @@ func processIPLimit(
 	state.BlockedUsers[userID] = block
 	stateMu.Unlock()
 
+	kickUser(
+		client,
+		cfg,
+		userID,
+		user.Username,
+		ips,
+		block.Duration,
+		"ip_limit",
+	)
+
 	logger.Printf(
 		"IP LIMIT | user=%s username=%s ips=%d limit=%d | disabled for %ds",
 		userID,
@@ -1960,7 +2191,7 @@ func processAntiAbuse(
 			)
 
 	abuse.Strikes =
-		pruneEventsKeepingGrace(
+		pruneEvents(
 			abuse.Strikes,
 			strikeCutoff,
 		)
@@ -2008,8 +2239,7 @@ func processAntiAbuse(
 	currentStrikes := 0
 
 	for _, event := range abuse.Strikes {
-		if event.IP != "__ip_limit_grace__" &&
-			event.Time >= strikeCutoff {
+		if event.Time >= strikeCutoff {
 			currentStrikes++
 		}
 	}
@@ -2107,6 +2337,16 @@ func processAntiAbuse(
 
 	stateMu.Unlock()
 
+	kickUser(
+		client,
+		cfg,
+		userID,
+		user.Username,
+		ips,
+		block.Duration,
+		"anti_abuse",
+	)
+
 	logger.Printf(
 		"ANTI-ABUSE | user=%s username=%s TEMPORARILY DISABLED for %ds after %d strikes",
 		userID,
@@ -2123,15 +2363,7 @@ func getGraceStart(
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
-	abuse := state.Abuse[userID]
-
-	for _, event := range abuse.Strikes {
-		if event.IP == "__ip_limit_grace__" {
-			return event.Time
-		}
-	}
-
-	return 0
+	return state.Abuse[userID].GraceStart
 }
 
 func setGraceStart(
@@ -2144,20 +2376,11 @@ func setGraceStart(
 
 	abuse := state.Abuse[userID]
 
-	for _, event := range abuse.Strikes {
-		if event.IP == "__ip_limit_grace__" {
-			return
-		}
+	if abuse.GraceStart != 0 {
+		return
 	}
 
-	abuse.Strikes =
-		append(
-			abuse.Strikes,
-			AbuseEvent{
-				IP:   "__ip_limit_grace__",
-				Time: now,
-			},
-		)
+	abuse.GraceStart = now
 
 	state.Abuse[userID] = abuse
 }
@@ -2169,20 +2392,13 @@ func clearGrace(
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
-	abuse := state.Abuse[userID]
+	abuse, ok := state.Abuse[userID]
 
-	kept := abuse.Strikes[:0]
-
-	for _, event := range abuse.Strikes {
-		if event.IP != "__ip_limit_grace__" {
-			kept = append(
-				kept,
-				event,
-			)
-		}
+	if !ok || abuse.GraceStart == 0 {
+		return
 	}
 
-	abuse.Strikes = kept
+	abuse.GraceStart = 0
 
 	if len(abuse.NewIPs) == 0 &&
 		len(abuse.Strikes) == 0 {
@@ -2257,6 +2473,10 @@ func processExpiredBlocks(
 
 		stateMu.Unlock()
 
+		kickMu.Lock()
+		delete(kickLast, id)
+		kickMu.Unlock()
+
 		if block.AbuseBan {
 			logger.Printf(
 				"ANTI-ABUSE | user=%s temporary ban expired; user re-enabled",
@@ -2298,22 +2518,6 @@ func pruneState(
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
-	stabilityMaxAge := int64(cfg.IPStabilityChecks+1) * int64(cfg.CheckInterval)
-	if stabilityMaxAge < 60 {
-		stabilityMaxAge = 60
-	}
-
-	for userID, ips := range state.IPStability {
-		for ip, seen := range ips {
-			if now-seen.LastSeen > stabilityMaxAge {
-				delete(ips, ip)
-			}
-		}
-		if len(ips) == 0 {
-			delete(state.IPStability, userID)
-		}
-	}
-
 	for userID, abuse :=
 		range state.Abuse {
 
@@ -2324,7 +2528,7 @@ func pruneState(
 			)
 
 		abuse.Strikes =
-			pruneEventsKeepingGrace(
+			pruneEvents(
 				abuse.Strikes,
 				strikeCutoff,
 			)
@@ -2350,7 +2554,8 @@ func pruneState(
 		}
 
 		if len(abuse.NewIPs) == 0 &&
-			len(abuse.Strikes) == 0 {
+			len(abuse.Strikes) == 0 &&
+			abuse.GraceStart == 0 {
 
 			delete(
 				state.Abuse,
@@ -2406,29 +2611,6 @@ func pruneEvents(
 	return kept
 }
 
-func pruneEventsKeepingGrace(
-	events []AbuseEvent,
-	cutoff int64,
-) []AbuseEvent {
-
-	kept := events[:0]
-
-	for _, event := range events {
-
-		if event.IP == "__ip_limit_grace__" ||
-			event.Time >= cutoff {
-
-			kept =
-				append(
-					kept,
-					event,
-				)
-		}
-	}
-
-	return kept
-}
-
 func consumeBurst(
 	events []AbuseEvent,
 	now int64,
@@ -2451,6 +2633,9 @@ func consumeBurst(
 
 func stringifyID(id interface{}) string {
 	switch value := id.(type) {
+
+	case nil:
+		return ""
 
 	case string:
 		return value
@@ -2488,6 +2673,688 @@ func trimBody(body []byte) string {
 	}
 
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// Cycle statistics
+// ---------------------------------------------------------------------------
+
+type cycleStats struct {
+	mu       sync.Mutex
+	failed   int
+	firstErr string
+}
+
+func (s *cycleStats) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.failed++
+
+	if s.firstErr == "" && err != nil {
+		s.firstErr = err.Error()
+	}
+}
+
+func cleanupOffline(state *RuntimeState, online map[string]struct{}) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	for userID := range state.IPStability {
+		if _, ok := online[userID]; !ok {
+			delete(state.IPStability, userID)
+		}
+	}
+
+	for userID, abuse := range state.Abuse {
+		if _, ok := online[userID]; ok {
+			continue
+		}
+
+		abuse.GraceStart = 0
+
+		if len(abuse.NewIPs) == 0 && len(abuse.Strikes) == 0 {
+			delete(state.Abuse, userID)
+		} else {
+			state.Abuse[userID] = abuse
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Node agent "kick" support
+//
+// The panel/node APIs have no way to close established connections, so an
+// optional agent on every node blocks the offending IPs in nftables for a
+// limited time and kills their sockets.
+// ---------------------------------------------------------------------------
+
+const (
+	kickHeaderTS      = "X-Teperip-Ts"
+	kickHeaderNonce   = "X-Teperip-Nonce"
+	kickHeaderSig     = "X-Teperip-Sig"
+	kickRetrySeconds  = 30
+	kickMaxIPsPerCall = 200
+)
+
+type kickRequest struct {
+	IPs     []string `json:"ips"`
+	Seconds int64    `json:"seconds"`
+	Block   bool     `json:"block"`
+	Kill    bool     `json:"kill"`
+	Reason  string   `json:"reason,omitempty"`
+}
+
+type kickResponse struct {
+	OK      bool     `json:"ok"`
+	Blocked []string `json:"blocked"`
+	Killed  int      `json:"killed"`
+	Skipped []string `json:"skipped"`
+	Error   string   `json:"error,omitempty"`
+}
+
+func boolOr(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+
+	return *value
+}
+
+func (c Config) insecureSkipVerify() bool {
+	return boolOr(c.InsecureSkipVerify, true)
+}
+
+func newNonce() string {
+	buf := make([]byte, 12)
+
+	if _, err := rand.Read(buf); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+
+	return hex.EncodeToString(buf)
+}
+
+func kickSign(
+	token string,
+	ts string,
+	nonce string,
+	method string,
+	path string,
+	body []byte,
+) string {
+	mac := hmac.New(sha256.New, []byte(token))
+
+	mac.Write([]byte(ts))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(nonce))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(method))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(path))
+	mac.Write([]byte("\n"))
+	mac.Write(body)
+
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func normalizeNodeHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+
+	if raw == "" {
+		return ""
+	}
+
+	if strings.Contains(raw, "://") {
+		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+	}
+
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		return host
+	}
+
+	return strings.Trim(raw, "[]")
+}
+
+func normalizeAgentURL(raw string, defaultPort int) string {
+	raw = strings.TrimSpace(raw)
+
+	if raw == "" {
+		return ""
+	}
+
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+
+	port := u.Port()
+	if port == "" {
+		port = strconv.Itoa(defaultPort)
+	}
+
+	return "https://" + net.JoinHostPort(u.Hostname(), port)
+}
+
+func cleanIPString(raw string) string {
+	raw = strings.TrimSpace(raw)
+
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		raw = host
+	}
+
+	raw = strings.Trim(raw, "[]")
+
+	if net.ParseIP(raw) == nil {
+		return ""
+	}
+
+	return raw
+}
+
+func (a *APIClient) getNodeHosts() ([]string, error) {
+	var raw json.RawMessage
+
+	if err := a.getJSON("/api/nodes", &raw); err != nil {
+		return nil, err
+	}
+
+	var list []map[string]interface{}
+
+	if err := json.Unmarshal(raw, &list); err != nil {
+		var envelope struct {
+			Nodes []map[string]interface{} `json:"nodes"`
+		}
+
+		if err2 := json.Unmarshal(raw, &envelope); err2 != nil {
+			return nil, fmt.Errorf("decode /api/nodes: %w", err2)
+		}
+
+		list = envelope.Nodes
+	}
+
+	seen := make(map[string]struct{})
+	hosts := make([]string, 0, len(list))
+
+	for _, node := range list {
+		address, _ := node["address"].(string)
+		host := normalizeNodeHost(address)
+
+		if host == "" {
+			continue
+		}
+
+		if _, ok := seen[host]; ok {
+			continue
+		}
+
+		seen[host] = struct{}{}
+		hosts = append(hosts, host)
+	}
+
+	return hosts, nil
+}
+
+const nodeCacheTTL = 2 * time.Minute
+
+var (
+	nodeCacheMu    sync.Mutex
+	nodeCacheHosts []string
+	nodeCacheAt    time.Time
+)
+
+// cachedNodeHosts asks the panel for its nodes at most once per TTL, no matter
+// how many users get kicked in the same cycle. The lock is held during the
+// fetch on purpose: concurrent callers wait for it and then hit the cache.
+func cachedNodeHosts(client *APIClient) ([]string, error) {
+	nodeCacheMu.Lock()
+	defer nodeCacheMu.Unlock()
+
+	if len(nodeCacheHosts) > 0 && time.Since(nodeCacheAt) < nodeCacheTTL {
+		return nodeCacheHosts, nil
+	}
+
+	hosts, err := client.getNodeHosts()
+
+	if err != nil {
+		if len(nodeCacheHosts) > 0 {
+			// Keep using the last good list and retry in ~20 seconds.
+			nodeCacheAt = time.Now().Add(-(nodeCacheTTL - 20*time.Second))
+
+			return nodeCacheHosts, nil
+		}
+
+		return nil, err
+	}
+
+	if len(hosts) > 0 {
+		nodeCacheHosts = hosts
+		nodeCacheAt = time.Now()
+	}
+
+	return hosts, nil
+}
+
+func kickAgentURLs(client *APIClient, cfg *Config) []string {
+	urls := make([]string, 0)
+	seen := make(map[string]struct{})
+
+	add := func(raw string) {
+		u := normalizeAgentURL(raw, cfg.Kick.AgentPort)
+
+		if u == "" {
+			return
+		}
+
+		if _, ok := seen[u]; ok {
+			return
+		}
+
+		seen[u] = struct{}{}
+		urls = append(urls, u)
+	}
+
+	hosts, err := cachedNodeHosts(client)
+	if err != nil {
+		logger.Printf("KICK | node list from panel failed: %v", err)
+	}
+
+	for _, host := range hosts {
+		add(host)
+	}
+
+	for _, extra := range cfg.Kick.ExtraAgents {
+		add(extra)
+	}
+
+	return urls
+}
+
+func newKickHTTPClient(cfg *Config) *http.Client {
+	return &http.Client{
+		Timeout: time.Duration(cfg.Kick.TimeoutSeconds) * time.Second,
+		Transport: &http.Transport{
+			// Agents use a self-signed certificate. Requests are
+			// authenticated with an HMAC signature instead.
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+			DisableKeepAlives: true,
+		},
+	}
+}
+
+func callAgent(
+	hc *http.Client,
+	token string,
+	baseURL string,
+	method string,
+	path string,
+	payload interface{},
+) ([]byte, error) {
+	var body []byte
+
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+
+		body = encoded
+	}
+
+	req, err := http.NewRequest(
+		method,
+		baseURL+path,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	nonce := newNonce()
+
+	req.Header.Set(kickHeaderTS, ts)
+	req.Header.Set(kickHeaderNonce, nonce)
+	req.Header.Set(
+		kickHeaderSig,
+		kickSign(token, ts, nonce, method, path, body),
+	)
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf(
+			"HTTP %d: %s",
+			resp.StatusCode,
+			trimBody(data),
+		)
+	}
+
+	return data, nil
+}
+
+func kickIPsNow(
+	client *APIClient,
+	cfg *Config,
+	label string,
+	ips []string,
+	seconds int64,
+) {
+	if cfg.Kick.Mode != "agents" || len(ips) == 0 {
+		return
+	}
+
+	token := cfg.Kick.AgentToken
+
+	if token == "" {
+		logger.Printf("KICK | kick.agent_token is empty; skipping %s", label)
+		return
+	}
+
+	if len(ips) > kickMaxIPsPerCall {
+		ips = ips[:kickMaxIPsPerCall]
+	}
+
+	if seconds < 1 {
+		seconds = 1
+	}
+
+	if limit := int64(cfg.Kick.MaxBlockSeconds); seconds > limit {
+		seconds = limit
+	}
+
+	targets := kickAgentURLs(client, cfg)
+
+	if len(targets) == 0 {
+		logger.Printf("KICK | no agents to contact for %s", label)
+		return
+	}
+
+	request := kickRequest{
+		IPs:     ips,
+		Seconds: seconds,
+		Block:   boolOr(cfg.Kick.BlockIP, true),
+		Kill:    boolOr(cfg.Kick.KillSockets, true),
+		Reason:  label,
+	}
+
+	hc := newKickHTTPClient(cfg)
+
+	var wg sync.WaitGroup
+
+	for _, target := range targets {
+		target := target
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			data, err := callAgent(
+				hc,
+				token,
+				target,
+				http.MethodPost,
+				"/v1/block",
+				request,
+			)
+			if err != nil {
+				logger.Printf(
+					"KICK | %s agent=%s failed: %v",
+					label,
+					target,
+					err,
+				)
+				return
+			}
+
+			var result kickResponse
+
+			if err := json.Unmarshal(data, &result); err != nil {
+				logger.Printf(
+					"KICK | %s agent=%s unreadable reply: %s",
+					label,
+					target,
+					trimBody(data),
+				)
+				return
+			}
+
+			logger.Printf(
+				"KICK | %s agent=%s blocked=%d killed=%d skipped=%d for %ds",
+				label,
+				target,
+				len(result.Blocked),
+				result.Killed,
+				len(result.Skipped),
+				seconds,
+			)
+		}()
+	}
+
+	wg.Wait()
+}
+
+func kickUser(
+	client *APIClient,
+	cfg *Config,
+	userID string,
+	username string,
+	ips map[string]struct{},
+	seconds int64,
+	reason string,
+) {
+	if cfg.Kick.Mode != "agents" || len(ips) == 0 {
+		return
+	}
+
+	list := make([]string, 0, len(ips))
+
+	for raw := range ips {
+		if ip := cleanIPString(raw); ip != "" {
+			list = append(list, ip)
+		}
+	}
+
+	if len(list) == 0 {
+		return
+	}
+
+	kickMu.Lock()
+	kickLast[userID] = time.Now().Unix()
+	kickMu.Unlock()
+
+	label := fmt.Sprintf(
+		"%s user=%s username=%s",
+		reason,
+		userID,
+		username,
+	)
+
+	go kickIPsNow(client, cfg, label, list, seconds)
+}
+
+// maybeRekick handles users we already disabled who still show up as online
+// (for example when the first kick missed an agent or the IP changed).
+func maybeRekick(
+	client *APIClient,
+	cfg *Config,
+	state *RuntimeState,
+	userID string,
+	username string,
+	ips map[string]struct{},
+) {
+	if cfg.Kick.Mode != "agents" || len(ips) == 0 {
+		return
+	}
+
+	stateMu.Lock()
+	block, ok := state.BlockedUsers[userID]
+	stateMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	now := time.Now().Unix()
+	remaining := block.BlockedAt + block.Duration - now
+
+	if remaining < 1 {
+		return
+	}
+
+	kickMu.Lock()
+	last := kickLast[userID]
+	kickMu.Unlock()
+
+	if now-last < kickRetrySeconds {
+		return
+	}
+
+	reason := "ip_limit-recheck"
+
+	if block.AbuseBan {
+		reason = "anti_abuse-recheck"
+	}
+
+	kickUser(client, cfg, userID, username, ips, remaining, reason)
+}
+
+// ---------------------------------------------------------------------------
+// Command line helpers: pg_ip_limit --kick-test | --kick-block IP [SECONDS]
+// ---------------------------------------------------------------------------
+
+func runCLI(cfg Config, args []string) int {
+	switch args[0] {
+	case "--kick-test":
+		return cliKickTest(&cfg)
+
+	case "--kick-block":
+		return cliKickBlock(&cfg, args[1:])
+
+	default:
+		fmt.Fprintf(
+			os.Stderr,
+			"unknown option %q\nusage: pg_ip_limit [--kick-test | --kick-block IP [SECONDS]]\n",
+			args[0],
+		)
+		return 2
+	}
+}
+
+func cliPanelClient(cfg *Config) (*APIClient, error) {
+	client, err := newAPIClient(*cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := client.login(); err != nil {
+		return nil, fmt.Errorf("panel login failed: %w", err)
+	}
+
+	return client, nil
+}
+
+func cliKickTest(cfg *Config) int {
+	if cfg.Kick.AgentToken == "" {
+		fmt.Println("kick.agent_token is empty in config.json")
+		return 1
+	}
+
+	client, err := cliPanelClient(cfg)
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+
+	targets := kickAgentURLs(client, cfg)
+
+	if len(targets) == 0 {
+		fmt.Println("no agents found (panel returned no nodes and extra_agents is empty)")
+		return 1
+	}
+
+	hc := newKickHTTPClient(cfg)
+	failed := 0
+
+	for _, target := range targets {
+		data, err := callAgent(
+			hc,
+			cfg.Kick.AgentToken,
+			target,
+			http.MethodGet,
+			"/v1/health",
+			nil,
+		)
+		if err != nil {
+			fmt.Printf("FAIL  %s  %v\n", target, err)
+			failed++
+			continue
+		}
+
+		fmt.Printf("OK    %s  %s\n", target, strings.TrimSpace(string(data)))
+	}
+
+	if failed > 0 {
+		return 1
+	}
+
+	return 0
+}
+
+func cliKickBlock(cfg *Config, args []string) int {
+	if len(args) < 1 {
+		fmt.Println("usage: pg_ip_limit --kick-block IP [SECONDS]")
+		return 2
+	}
+
+	ip := cleanIPString(args[0])
+
+	if ip == "" {
+		fmt.Println("invalid IP address")
+		return 2
+	}
+
+	seconds := int64(60)
+
+	if len(args) > 1 {
+		value, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil || value < 1 {
+			fmt.Println("SECONDS must be a positive integer")
+			return 2
+		}
+
+		seconds = value
+	}
+
+	client, err := cliPanelClient(cfg)
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+
+	cfg.Kick.Mode = "agents"
+
+	kickIPsNow(client, cfg, "manual-test", []string{ip}, seconds)
+
+	return 0
 }
 GO
 
@@ -2638,701 +3505,6 @@ test_api() {
     return 1
 }
 
-read_config_value() {
-    local filter="$1"
-    local fallback="$2"
-
-    if [[ -r "$CONFIG_FILE" ]] &&
-       jq empty "$CONFIG_FILE" >/dev/null 2>&1
-    then
-        jq -r "$filter" \
-            "$CONFIG_FILE" \
-            2>/dev/null ||
-            printf '%s' "$fallback"
-    else
-        printf '%s' "$fallback"
-    fi
-}
-
-show_status() {
-    clear
-
-    echo -e \
-        "${CYAN}━━━━━━━━━━━━ TeperIP Status ━━━━━━━━━━━━${NC}"
-
-    local service_status
-    local anti_abuse
-    local panel_url
-    local interval
-    local workers
-    local binary_version
-
-    service_status="$(
-        systemctl is-active \
-            "$SERVICE_NAME" \
-            2>/dev/null ||
-            echo inactive
-    )"
-
-    panel_url="$(
-        read_config_value \
-            '.panel_url // "UNKNOWN"' \
-            'UNKNOWN'
-    )"
-
-    interval="$(
-        read_config_value \
-            '.check_interval // "UNKNOWN"' \
-            'UNKNOWN'
-    )"
-
-    workers="$(
-        read_config_value \
-            '.max_workers // "UNKNOWN"' \
-            'UNKNOWN'
-    )"
-
-    binary_version="$(
-        read_config_value \
-            '.version // "UNKNOWN"' \
-            'UNKNOWN'
-    )"
-
-    anti_abuse="UNKNOWN"
-
-    if [[ -r "$CONFIG_FILE" ]] &&
-       jq empty "$CONFIG_FILE" >/dev/null 2>&1
-    then
-        anti_abuse="$(
-            jq -r \
-                'if (.anti_abuse.enabled? // false)
-                 then "ON"
-                 else "OFF"
-                 end' \
-                "$CONFIG_FILE" \
-                2>/dev/null ||
-                echo UNKNOWN
-        )"
-    fi
-
-    echo "Version:        $binary_version"
-    echo "Service:        $service_status"
-    echo "Panel:          $panel_url"
-    echo "Interval:       ${interval}s"
-    echo "Workers:        $workers"
-    echo "Anti-Abuse:     $anti_abuse"
-    echo "Binary:         $BINARY_FILE"
-    echo "State:          $STATE_FILE"
-
-    echo
-
-    if [[ -r "$STATE_FILE" ]] &&
-       jq empty "$STATE_FILE" >/dev/null 2>&1
-    then
-        echo "Blocked users:  $(
-            jq \
-                '.blocked_users // {} | length' \
-                "$STATE_FILE" \
-                2>/dev/null ||
-                echo UNKNOWN
-        )"
-
-        echo "Tracked users:  $(
-            jq \
-                '.ip_history // {} | length' \
-                "$STATE_FILE" \
-                2>/dev/null ||
-                echo UNKNOWN
-        )"
-    else
-        echo "Runtime state:  UNKNOWN"
-    fi
-}
-
-show_logs() {
-    clear
-
-    echo -e \
-        "${CYAN}━━━━━━━━━━━━ Live Logs ━━━━━━━━━━━━${NC}"
-
-    echo "Press Ctrl+C to exit."
-    echo
-
-    journalctl \
-        -u "$SERVICE_NAME" \
-        -f \
-        -n 80
-}
-
-edit_config() {
-    local editor
-
-    editor="${EDITOR:-nano}"
-
-    if ! command_exists "$editor"; then
-        editor="vi"
-    fi
-
-    "$editor" "$CONFIG_FILE"
-
-    if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-        warn "config.json is invalid JSON after editing."
-        return 1
-    fi
-
-    systemctl restart "$SERVICE_NAME" || true
-
-    ok "Configuration saved and service restarted."
-}
-
-backup_config() {
-    local stamp
-    local target
-
-    stamp="$(date +%Y%m%d_%H%M%S)"
-
-    target="$BACKUP_DIR/config_$stamp.json"
-
-    cp -f \
-        "$CONFIG_FILE" \
-        "$target"
-
-    chmod 600 "$target"
-
-    ok "Backup: $target"
-}
-
-show_runtime_state() {
-    if [[ -r "$STATE_FILE" ]] &&
-       jq empty "$STATE_FILE" >/dev/null 2>&1
-    then
-        jq . "$STATE_FILE"
-    else
-        warn "runtime_state.json is unreadable."
-    fi
-}
-
-set_jq_number() {
-    local key="$1"
-    local value="$2"
-    local tmp
-
-    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-        warn "Value must be a positive integer."
-        return 1
-    fi
-
-    tmp="$(mktemp)"
-
-    jq \
-        --argjson value "$value" \
-        ".${key} = \$value" \
-        "$CONFIG_FILE" \
-        > "$tmp"
-
-    chmod 600 "$tmp"
-
-    mv "$tmp" "$CONFIG_FILE"
-}
-
-anti_abuse_settings() {
-    while true; do
-        clear
-
-        echo -e \
-            "${CYAN}━━━━━━━━━━━━ Anti-Abuse Settings ━━━━━━━━━━━━${NC}"
-
-        local enabled
-        local threshold
-        local window
-        local strikes
-        local strike_window
-        local ban
-        local retention
-        local max_events
-        local choice
-        local value
-        local new_enabled
-        local tmp
-
-        enabled="$(
-            read_config_value \
-                '.anti_abuse.enabled // false' \
-                'false'
-        )"
-
-        threshold="$(
-            read_config_value \
-                '.anti_abuse.new_ip_threshold // 20' \
-                '20'
-        )"
-
-        window="$(
-            read_config_value \
-                '.anti_abuse.new_ip_window_seconds // 60' \
-                '60'
-        )"
-
-        strikes="$(
-            read_config_value \
-                '.anti_abuse.strike_threshold // 3' \
-                '3'
-        )"
-
-        strike_window="$(
-            read_config_value \
-                '.anti_abuse.strike_window_seconds // 1800' \
-                '1800'
-        )"
-
-        ban="$(
-            read_config_value \
-                '.anti_abuse.ban_seconds // 3600' \
-                '3600'
-        )"
-
-        retention="$(
-            read_config_value \
-                '.anti_abuse.log_retention_seconds // 86400' \
-                '86400'
-        )"
-
-        max_events="$(
-            read_config_value \
-                '.anti_abuse.max_events_per_user // 1000' \
-                '1000'
-        )"
-
-        echo "Status:              $enabled"
-        echo "New IP threshold:    $threshold"
-        echo "New IP window:       ${window}s"
-        echo "Strike threshold:    $strikes"
-        echo "Strike window:       ${strike_window}s"
-        echo "Temporary ban:       ${ban}s"
-        echo "History retention:   ${retention}s"
-        echo "Max events/user:     $max_events"
-
-        echo
-
-        echo "1) Enable / Disable"
-        echo "2) Change New IP threshold"
-        echo "3) Change New IP window"
-        echo "4) Change Strike threshold"
-        echo "5) Change Strike window"
-        echo "6) Change Temporary Ban duration"
-        echo "7) Change History retention"
-        echo "8) Change Max events/user"
-        echo "9) Show Runtime State"
-        echo "0) Back"
-
-        echo
-
-        read -r -p "Select: " choice
-
-        case "$choice" in
-
-            1)
-                if [[ "$enabled" == "true" ]]; then
-                    new_enabled=false
-                else
-                    new_enabled=true
-                fi
-
-                tmp="$(mktemp)"
-
-                jq \
-                    --argjson value "$new_enabled" \
-                    '.anti_abuse.enabled = $value' \
-                    "$CONFIG_FILE" \
-                    > "$tmp"
-
-                chmod 600 "$tmp"
-                mv "$tmp" "$CONFIG_FILE"
-
-                systemctl restart "$SERVICE_NAME" || true
-
-                ok "Anti-Abuse = $new_enabled"
-
-                pause_menu
-                ;;
-
-            2)
-                read -r \
-                    -p "New IP threshold [$threshold]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.new_ip_threshold' \
-                    "${value:-$threshold}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            3)
-                read -r \
-                    -p "New IP window seconds [$window]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.new_ip_window_seconds' \
-                    "${value:-$window}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            4)
-                read -r \
-                    -p "Strike threshold [$strikes]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.strike_threshold' \
-                    "${value:-$strikes}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            5)
-                read -r \
-                    -p "Strike window seconds [$strike_window]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.strike_window_seconds' \
-                    "${value:-$strike_window}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            6)
-                read -r \
-                    -p "Temporary ban seconds [$ban]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.ban_seconds' \
-                    "${value:-$ban}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            7)
-                read -r \
-                    -p "History retention seconds [$retention]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.log_retention_seconds' \
-                    "${value:-$retention}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            8)
-                read -r \
-                    -p "Max events/user [$max_events]: " \
-                    value
-
-                set_jq_number \
-                    'anti_abuse.max_events_per_user' \
-                    "${value:-$max_events}" ||
-                    true
-
-                systemctl restart "$SERVICE_NAME" || true
-                ;;
-
-            9)
-                clear
-                show_runtime_state
-                pause_menu
-                ;;
-
-            0)
-                return
-                ;;
-
-            *)
-                warn "Invalid selection."
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-version_parts() {
-    local v="$1"
-    local a b c
-
-    v="${v#v}"
-    v="${v%%-*}"
-
-    IFS=. read -r a b c <<< "$v"
-
-    a="${a:-0}"
-    b="${b:-0}"
-    c="${c:-0}"
-
-    [[ "$a" =~ ^[0-9]+$ ]] || a=0
-    [[ "$b" =~ ^[0-9]+$ ]] || b=0
-    [[ "$c" =~ ^[0-9]+$ ]] || c=0
-
-    printf '%d %d %d\n' \
-        "$((10#$a))" \
-        "$((10#$b))" \
-        "$((10#$c))"
-}
-
-version_gt() {
-    local a1 a2 a3
-    local b1 b2 b3
-
-    read -r a1 a2 a3 <<< \
-        "$(version_parts "$1")"
-
-    read -r b1 b2 b3 <<< \
-        "$(version_parts "$2")"
-
-    ((a1 > b1)) && return 0
-    ((a1 < b1)) && return 1
-
-    ((a2 > b2)) && return 0
-    ((a2 < b2)) && return 1
-
-    ((a3 > b3))
-}
-
-version_eq() {
-    local a1 a2 a3
-    local b1 b2 b3
-
-    read -r a1 a2 a3 <<< \
-        "$(version_parts "$1")"
-
-    read -r b1 b2 b3 <<< \
-        "$(version_parts "$2")"
-
-    ((a1 == b1 &&
-      a2 == b2 &&
-      a3 == b3))
-}
-
-get_latest_release_version() {
-    curl \
-        -fsSL \
-        --max-time 5 \
-        -H 'Accept: application/vnd.github+json' \
-        "$GITHUB_RELEASES_URL" \
-        2>/dev/null |
-        jq -r \
-            '.tag_name // empty' \
-            2>/dev/null |
-        sed 's/^v//' |
-        head -n1
-}
-
-get_installer_version() {
-    curl \
-        -fsSL \
-        --max-time 5 \
-        "$INSTALLER_URL" \
-        2>/dev/null |
-        sed \
-            -n \
-            's/^CURRENT_VERSION="\([^"]*\)"/\1/p' |
-        head -n1
-}
-
-check_updates() {
-    clear
-
-    echo -e \
-        "${CYAN}━━━━━━━━━━━━ Check for Updates ━━━━━━━━━━━━${NC}"
-
-    echo "Current version: v$CURRENT_VERSION"
-    echo
-
-    local latest
-    local installer_version
-    local confirm
-    local tmp
-
-    latest="$(
-        get_latest_release_version ||
-        true
-    )"
-
-    if [[ -z "$latest" ]]; then
-
-        latest="$(
-            get_installer_version ||
-            true
-        )"
-
-        if [[ -z "$latest" ]]; then
-            warn "Could not connect to GitHub or Release/Installer cannot be fetched."
-            pause_menu
-            return
-        fi
-
-        echo "Check source: Published version on main"
-
-    else
-
-        echo "Check source: GitHub Release"
-        echo "Latest Release: v$latest"
-
-    fi
-
-    if version_gt \
-        "$latest" \
-        "$CURRENT_VERSION"
-    then
-
-        echo -e \
-            "${YELLOW}[!] New version found: v$latest (Current: v$CURRENT_VERSION)${NC}"
-
-        read -r \
-            -p "Do you want to update? (y/n): " \
-            confirm
-
-        [[ "$confirm" =~ ^[Yy]$ ]] ||
-            return
-
-    elif version_eq \
-        "$latest" \
-        "$CURRENT_VERSION"
-    then
-
-        echo -e \
-            "${GREEN}[OK] You are using the latest version (v$CURRENT_VERSION).${NC}"
-
-        read -r \
-            -p "Do you want to reinstall? (y/n): " \
-            confirm
-
-        [[ "$confirm" =~ ^[Yy]$ ]] ||
-            return
-
-    else
-
-        echo -e \
-            "${GREEN}[OK] Installed version ($CURRENT_VERSION) is newer than checked version ($latest).${NC}"
-
-        pause_menu
-        return
-    fi
-
-    installer_version="$(
-        get_installer_version ||
-        true
-    )"
-
-    if [[ -z "$installer_version" ]]; then
-        warn "Installer version could not be fetched from GitHub."
-        pause_menu
-        return
-    fi
-
-    if ! version_gt \
-        "$installer_version" \
-        "$CURRENT_VERSION" &&
-       ! version_eq \
-        "$installer_version" \
-        "$CURRENT_VERSION"
-    then
-        warn "Installer on main is older than the installed version; update aborted."
-        pause_menu
-        return
-    fi
-
-    tmp="$(
-        mktemp \
-            /tmp/teperip-install.XXXXXX.sh
-    )"
-
-    if ! curl \
-        -fsSL \
-        --retry 3 \
-        --connect-timeout 10 \
-        --max-time 60 \
-        "$INSTALLER_URL" \
-        -o "$tmp"
-    then
-
-        rm -f "$tmp"
-
-        err "Failed to download installer."
-
-        pause_menu
-        return
-    fi
-
-    chmod +x "$tmp"
-
-    bash "$tmp"
-
-    rm -f "$tmp"
-
-    exit 0
-}
-
-uninstall_teperip() {
-    echo
-    warn "This operation will remove TeperIP from the system."
-
-    read -r \
-        -p "Type REMOVE to confirm: " \
-        confirm
-
-    [[ "$confirm" == "REMOVE" ]] ||
-        {
-            echo "Cancelled."
-            return
-        }
-
-    systemctl disable --now \
-        "$SERVICE_NAME" \
-        >/dev/null 2>&1 ||
-        true
-
-    rm -f \
-        "$SERVICE_FILE" \
-        "$MENU_FILE" \
-        "$INSTALL_DIR/pg_ip_limit_menu" \
-        /etc/systemd/journald.conf.d/teperip.conf
-
-    systemctl daemon-reload
-
-    systemctl restart systemd-journald \
-        >/dev/null 2>&1 ||
-        true
-
-    echo
-    echo "Do you also want to delete /opt/pg_iplimit and backups?"
-
-    read -r \
-        -p "(y/n): " \
-        delete_data
-
-    if [[ "$delete_data" =~ ^[Yy]$ ]]; then
-
-        rm -rf "$INSTALL_DIR"
-
-        ok "TeperIP and its data have been removed."
-
-    else
-
-        ok "Service removed; data remains in $INSTALL_DIR."
-
-    fi
-}
-
 create_menu() {
 
     cat > "$MENU_FILE" <<'EOF_MENU'
@@ -3351,15 +3523,18 @@ set -euo pipefail
 INSTALL_DIR="/opt/pg_iplimit"
 CONFIG_FILE="$INSTALL_DIR/config.json"
 STATE_FILE="$INSTALL_DIR/runtime_state.json"
+DB_FILE="$INSTALL_DIR/teperip.db"
+BINARY_FILE="$INSTALL_DIR/pg_ip_limit"
 BACKUP_DIR="$INSTALL_DIR/backups"
 
 SERVICE_NAME="pg_iplimit.service"
 
-CURRENT_VERSION="1.3.6"
+CURRENT_VERSION="1.4.0"
 
 INSTALLER_URL="https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-install.sh"
 
 GITHUB_RELEASES_URL="https://api.github.com/repos/Jyavaz68/teperip/releases/latest"
+AGENT_INSTALLER_URL="https://raw.githubusercontent.com/Jyavaz68/teperip/main/teperip-agent-install.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -3461,6 +3636,7 @@ show_status() {
     echo "Interval:       ${i}s"
     echo "Workers:        $w"
     echo "Anti-Abuse:     $a"
+    echo "Kick:           $(read_config_value '.kick.mode // "off"' off)"
     echo "Binary:         $INSTALL_DIR/pg_ip_limit"
     echo "State:          $STATE_FILE"
 
@@ -4031,6 +4207,259 @@ uninstall() {
         rm -rf "$INSTALL_DIR"
 }
 
+cfg_set_json() {
+    # usage: cfg_set_json '.kick.mode' '"agents"'   (value must be valid JSON)
+    local path="$1"
+    local value="$2"
+    local t
+
+    t="$(mktemp)"
+
+    if jq --argjson v "$value" "$path = \$v" "$CONFIG_FILE" > "$t"; then
+        chmod 600 "$t"
+        mv "$t" "$CONFIG_FILE"
+    else
+        rm -f "$t"
+        echo "Failed to update config.json."
+        return 1
+    fi
+}
+
+cfg_set_string() {
+    local path="$1"
+    local value="$2"
+    local t
+
+    t="$(mktemp)"
+
+    if jq --arg v "$value" "$path = \$v" "$CONFIG_FILE" > "$t"; then
+        chmod 600 "$t"
+        mv "$t" "$CONFIG_FILE"
+    else
+        rm -f "$t"
+        echo "Failed to update config.json."
+        return 1
+    fi
+}
+
+generate_token() {
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+show_agent_install_command() {
+    local token port master_ip detected
+
+    token="$(read_config_value '.kick.agent_token // ""' '')"
+    port="$(read_config_value '.kick.agent_port // 8765' 8765)"
+    master_ip="$(read_config_value '.kick.master_ip // ""' '')"
+
+    if [[ -z "$master_ip" ]]; then
+        detected="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+
+        read -r -p "Public IP of THIS (panel) server [${detected:-unknown}]: " master_ip
+        master_ip="${master_ip:-$detected}"
+
+        if [[ -z "$master_ip" ]]; then
+            echo "No IP given."
+            return 1
+        fi
+
+        cfg_set_string '.kick.master_ip' "$master_ip" || true
+    fi
+
+    echo
+    echo "Run this on EVERY node server (as root):"
+    echo
+    echo "curl -fsSL $AGENT_INSTALLER_URL | sudo bash -s -- --token $token --master-ip $master_ip --port $port"
+    echo
+    echo "Small server (<1GB RAM)? Add --prebuilt to avoid compiling on the node."
+    echo "If the panel and a node share one server, also run it there and add"
+    echo "https://127.0.0.1:$port as an extra agent (option 8)."
+}
+
+kick_menu() {
+    while true; do
+
+        clear
+
+        echo -e "${CYAN}━━━━━━━━━━━━ Kick Settings (node agents) ━━━━━━━━━━━━${NC}"
+
+        local mode port token master_ip block kill maxb extra c x
+
+        mode="$(read_config_value '.kick.mode // "off"' off)"
+        port="$(read_config_value '.kick.agent_port // 8765' 8765)"
+        token="$(read_config_value '.kick.agent_token // ""' '')"
+        master_ip="$(read_config_value '.kick.master_ip // ""' '')"
+        block="$(read_config_value 'if .kick.block_ip == null then true else .kick.block_ip end' true)"
+        kill="$(read_config_value 'if .kick.kill_sockets == null then true else .kick.kill_sockets end' true)"
+        maxb="$(read_config_value '.kick.max_block_seconds // 3600' 3600)"
+        extra="$(read_config_value '(.kick.extra_agents // []) | join(",")' '')"
+
+        echo "Mode:               $mode"
+        echo "Agent port:         $port"
+        echo "Agent token:        ${token:0:8}... (hidden)"
+        echo "Panel server IP:    ${master_ip:-not set}"
+        echo "Block IP (nft):     $block"
+        echo "Kill sockets (ss):  $kill"
+        echo "Max block seconds:  $maxb"
+        echo "Extra agents:       ${extra:-none}"
+
+        echo
+
+        echo "1) Enable / Disable kick"
+        echo "2) Show node install command"
+        echo "3) Test agents (health check)"
+        echo "4) Regenerate token"
+        echo "5) Set panel server IP"
+        echo "6) Change agent port"
+        echo "7) Toggle block IP / kill sockets"
+        echo "8) Add extra agent URL"
+        echo "9) Clear extra agents"
+        echo "0) Back"
+
+        echo
+
+        read -r -p "Select: " c
+
+        case "$c" in
+
+            1)
+                if [[ "$mode" == "agents" ]]; then
+                    cfg_set_json '.kick.mode' '"off"' || true
+                    echo "Kick disabled."
+                else
+                    if [[ -z "$token" ]]; then
+                        cfg_set_string '.kick.agent_token' "$(generate_token)" || true
+                    fi
+
+                    cfg_set_json '.kick.mode' '"agents"' || true
+                    echo "Kick enabled. Make sure the agent is installed on your nodes (option 2),"
+                    echo "then verify with option 3."
+                fi
+
+                systemctl restart "$SERVICE_NAME" || true
+                pause_menu
+                ;;
+
+            2)
+                show_agent_install_command || true
+                pause_menu
+                ;;
+
+            3)
+                echo
+                "$BINARY_FILE" --kick-test || true
+                pause_menu
+                ;;
+
+            4)
+                read -r -p "Regenerate the token? Agents must be reinstalled with the new one. (y/n): " x
+
+                if [[ "$x" =~ ^[Yy]$ ]]; then
+                    cfg_set_string '.kick.agent_token' "$(generate_token)" || true
+                    systemctl restart "$SERVICE_NAME" || true
+                    echo "New token saved. Re-run the install command (option 2) on every node."
+                fi
+
+                pause_menu
+                ;;
+
+            5)
+                read -r -p "Public IP of this panel server [$master_ip]: " x
+                x="${x:-$master_ip}"
+
+                if [[ -n "$x" ]]; then
+                    cfg_set_string '.kick.master_ip' "$x" || true
+                fi
+                ;;
+
+            6)
+                read -r -p "Agent port [$port]: " x
+                x="${x:-$port}"
+
+                if [[ "$x" =~ ^[0-9]+$ ]] && ((x >= 1 && x <= 65535)); then
+                    cfg_set_json '.kick.agent_port' "$((10#$x))" || true
+                    systemctl restart "$SERVICE_NAME" || true
+                    echo "Agents must listen on the same port; re-run the install command on the nodes."
+                else
+                    echo "Invalid port."
+                fi
+
+                pause_menu
+                ;;
+
+            7)
+                echo "a) block IP in nftables   (currently: $block)"
+                echo "b) kill established sockets (currently: $kill)"
+
+                read -r -p "Toggle which one (a/b): " x
+
+                case "$x" in
+                    a)
+                        if [[ "$block" == "true" ]]; then
+                            cfg_set_json '.kick.block_ip' false || true
+                        else
+                            cfg_set_json '.kick.block_ip' true || true
+                        fi
+                        ;;
+                    b)
+                        if [[ "$kill" == "true" ]]; then
+                            cfg_set_json '.kick.kill_sockets' false || true
+                        else
+                            cfg_set_json '.kick.kill_sockets' true || true
+                        fi
+                        ;;
+                    *)
+                        echo "Nothing changed."
+                        ;;
+                esac
+
+                systemctl restart "$SERVICE_NAME" || true
+                pause_menu
+                ;;
+
+            8)
+                read -r -p "Agent URL (e.g. https://127.0.0.1:$port): " x
+
+                if [[ -n "$x" ]]; then
+                    local t
+                    t="$(mktemp)"
+
+                    if jq --arg u "$x" '.kick.extra_agents = (((.kick.extra_agents // []) + [$u]) | unique)' "$CONFIG_FILE" > "$t"; then
+                        chmod 600 "$t"
+                        mv "$t" "$CONFIG_FILE"
+                        systemctl restart "$SERVICE_NAME" || true
+                        echo "Added."
+                    else
+                        rm -f "$t"
+                        echo "Failed to update config.json."
+                    fi
+                fi
+
+                pause_menu
+                ;;
+
+            9)
+                cfg_set_json '.kick.extra_agents' '[]' || true
+                systemctl restart "$SERVICE_NAME" || true
+                echo "Cleared."
+                pause_menu
+                ;;
+
+            0)
+                return
+                ;;
+
+            *)
+                echo "Invalid selection."
+                sleep 1
+                ;;
+
+        esac
+
+    done
+}
+
 show_active_blocks() {
     clear
 
@@ -4095,6 +4524,7 @@ while true; do
     echo "9) Uninstall"
     echo "10) Check for Updates"
     echo "11) Active TeperIP Blocks"
+    echo "12) Kick Settings (node agents)"
     echo "0) Exit"
 
     echo
@@ -4158,6 +4588,10 @@ while true; do
         11)
             show_active_blocks
             pause_menu
+            ;;
+
+        12)
+            kick_menu
             ;;
 
         0)
@@ -4271,6 +4705,7 @@ install_all() {
     echo "Config:     $CONFIG_FILE"
     echo "State:      $STATE_FILE"
     echo "Database:   $DB_FILE"
+    echo "Kick:       off (enable it from the menu: teperip -> 12)"
 
     echo -e \
         "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
